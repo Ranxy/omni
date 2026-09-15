@@ -181,6 +181,38 @@ func TestSplitQuotingAndComments(t *testing.T) {
 			want: []string{"SELECT /* /* ; */ */ 1", " SELECT 2"},
 		},
 		{
+			// MySQL and MariaDB close a block comment at the first */, so text
+			// after it -- including a ';' -- is live SQL, not comment content.
+			// The depth-nesting bug used to read through to the LAST */ and
+			// swallow the DROP TABLE statement as part of the comment.
+			name: "text after a nested-looking comment is a live statement",
+			sql:  "INSERT INTO t3 SELECT * FROM t /* /* */; DROP TABLE t4; -- */",
+			want: []string{"INSERT INTO t3 SELECT * FROM t /* /* */", " DROP TABLE t4"},
+		},
+		{
+			// An executable comment's OWN close is still found by depth-counting
+			// (matching the lexer's exec-comment scan), so a plain comment nested
+			// inside it does not end the executable comment early.
+			name: "nested plain comment inside an executable comment",
+			sql:  "/*! /* c */ SELECT 1; */ SELECT 2;",
+			want: []string{"/*! /* c */ SELECT 1; */ SELECT 2"},
+		},
+		{
+			// TiDB's own /*T!...*/ executable comment gets the same depth-counted
+			// close as /*!...*/.
+			name: "nested plain comment inside a TiDB executable comment",
+			sql:  "/*T! /* c */ SELECT 1; */ SELECT 2;",
+			want: []string{"/*T! /* c */ SELECT 1; */ SELECT 2"},
+		},
+		{
+			// An unsupported /*T![feature] gate is an ordinary comment to the
+			// lexer (it never splices the content in), so it closes at the first
+			// */ like any other plain comment.
+			name: "unsupported TiDB feature gate is an ordinary comment",
+			sql:  "SELECT 1 /*T![future] /* c */; DROP TABLE t; -- */",
+			want: []string{"SELECT 1 /*T![future] /* c */", " DROP TABLE t"},
+		},
+		{
 			name: "-- without space is not comment",
 			sql:  "SELECT 1--2; SELECT 3;",
 			want: []string{"SELECT 1--2", " SELECT 3"},

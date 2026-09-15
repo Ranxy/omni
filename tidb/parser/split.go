@@ -1,5 +1,7 @@
 package parser
 
+import "strings"
+
 // Segment represents a portion of SQL text delimited by top-level semicolons.
 type Segment struct {
 	Text      string // the raw text of this segment (without trailing semicolon)
@@ -519,11 +521,51 @@ func skipHashComment(sql string, i int) int {
 	return i
 }
 
-// skipBlockCommentMySQL skips a block comment starting at position i.
-// Supports nesting. Handles both regular /* ... */ and conditional /*!...*/
-// comments (for Split purposes, the entire construct is skipped).
-// Returns position after the closing */ (or end of input).
+// isExecutableCommentStart reports whether sql[i:] opens an executable
+// comment (/*!...*/ or TiDB's /*T!...*/). The lexer searches for THAT
+// comment's own close by depth-counting nested /* sequences (lexer.go), so
+// Split must agree on where it ends; only an ordinary comment closes at the
+// first */. Like the lexer, a /*T![...] gate with a malformed bracket or an
+// unsupported feature is an ordinary comment.
+func isExecutableCommentStart(sql string, i int) bool {
+	if i+2 < len(sql) && sql[i] == '/' && sql[i+1] == '*' && sql[i+2] == '!' {
+		return true
+	}
+	if !(i+3 < len(sql) && sql[i] == '/' && sql[i+1] == '*' && sql[i+2] == 'T' && sql[i+3] == '!') {
+		return false
+	}
+	gate := i + 4
+	if gate >= len(sql) || sql[gate] != '[' {
+		return true
+	}
+	bracketEnd := strings.IndexByte(sql[gate+1:], ']')
+	return bracketEnd >= 0 && allTiDBFeaturesSupported(sql[gate+1:gate+1+bracketEnd])
+}
+
+// skipBlockCommentMySQL skips a block comment starting at position i. An
+// ordinary MySQL, MariaDB, or TiDB block comment ends at the FIRST closing
+// */, even if its content contains further /* sequences; an executable
+// comment (/*!...*/ or /*T!...*/) is depth-counted instead, matching how the
+// lexer finds its close. Returns position after the closing */ (or end of
+// input).
 func skipBlockCommentMySQL(sql string, i int) int {
+	if isExecutableCommentStart(sql, i) {
+		return skipBlockCommentDepthCounted(sql, i)
+	}
+	i += 2 // skip /*
+	for i < len(sql) {
+		if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+			return i + 2
+		}
+		i++
+	}
+	return i
+}
+
+// skipBlockCommentDepthCounted finds the close of an executable comment by
+// depth-counting nested /* sequences, matching the lexer's own exec-comment
+// scan. Returns position after the closing */ (or end of input).
+func skipBlockCommentDepthCounted(sql string, i int) int {
 	i += 2 // skip /*
 	depth := 1
 	for i < len(sql) && depth > 0 {
