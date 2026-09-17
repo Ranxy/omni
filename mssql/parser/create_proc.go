@@ -425,6 +425,8 @@ func (p *Parser) parseCreateFunctionStmt(orAlter bool) (*nodes.CreateFunctionStm
 		stmt.ExternalName = p.parseMethodSpecifier()
 	} else if p.cur.Type == kwRETURN {
 		// Inline table-valued function: RETURN [ ( ] select_stmt [ ) ]
+		// The select_statement may carry its own CTE list, with or without
+		// the parentheses (SQL Server 2022 oracle).
 		retLoc := p.pos()
 		p.advance() // consume RETURN
 		hasParen := false
@@ -432,7 +434,7 @@ func (p *Parser) parseCreateFunctionStmt(orAlter bool) (*nodes.CreateFunctionStm
 			hasParen = true
 			p.advance()
 		}
-		selectStmt, err := p.parseSelectStmt()
+		selectStmt, err := p.parseSelectStmtWithCTE()
 		if err != nil {
 			return nil, err
 		}
