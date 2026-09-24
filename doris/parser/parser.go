@@ -9,6 +9,7 @@ package parser
 
 import (
 	"github.com/bytebase/omni/doris/ast"
+	"strings"
 )
 
 // Parser is a recursive-descent parser for Doris SQL. It operates on a
@@ -30,6 +31,19 @@ type Parser struct {
 	// (such as EXPLAIN's raw-query recovery) that would mask a nested
 	// parse failure.
 	strictTrailing bool
+
+	// rawQueries lists every query body this parse captured as raw text
+	// without parsing it (subquery placeholders, the CTAS query), in source
+	// order, so the strict entry point can validate them. restore truncates
+	// it, so an abandoned speculative parse leaves nothing behind.
+	rawQueries []rawQuery
+}
+
+// rawQuery is a query body captured as raw text: the text and the absolute
+// byte offset of its first character in the parser's input.
+type rawQuery struct {
+	text  string
+	start int
 }
 
 // nextToken returns the next token from the lexer, transparently skipping
@@ -74,6 +88,7 @@ type parserCheckpoint struct {
 	hasNext            bool
 	lexPos, lexStart   int
 	errLen, lexErrLen  int
+	rawLen             int // len(p.rawQueries)
 }
 
 // save captures the current parser state.
@@ -87,6 +102,7 @@ func (p *Parser) save() parserCheckpoint {
 		lexStart:  p.lexer.start,
 		errLen:    len(p.errors),
 		lexErrLen: len(p.lexer.errors),
+		rawLen:    len(p.rawQueries),
 	}
 }
 
@@ -101,6 +117,9 @@ func (p *Parser) restore(c parserCheckpoint) {
 	p.lexer.start = c.lexStart
 	p.errors = p.errors[:c.errLen]
 	p.lexer.errors = p.lexer.errors[:c.lexErrLen]
+	if len(p.rawQueries) > c.rawLen {
+		p.rawQueries = p.rawQueries[:c.rawLen]
+	}
 }
 
 // peek returns the current token without consuming it.
@@ -154,8 +173,8 @@ func (p *Parser) syntaxErrorAtCur() *ParseError {
 		msg = "syntax error at or near " + text
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: msg,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
 	}
 }
 
@@ -199,8 +218,8 @@ func (p *Parser) skipToNextStatement() {
 // tokens themselves and produce real AST nodes.
 func (p *Parser) unsupported(stmtName string) (ast.Node, error) {
 	err := &ParseError{
-		Loc: p.cur.Loc,
-		Msg: stmtName + " statement parsing is not yet supported",
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: stmtName + " statement parsing is not yet supported",
 	}
 	p.skipToNextStatement()
 	return nil, err
@@ -212,8 +231,8 @@ func (p *Parser) unsupported(stmtName string) (ast.Node, error) {
 func (p *Parser) unknownStatementError() *ParseError {
 	if p.cur.Kind == tokEOF {
 		return &ParseError{
-			Loc: p.cur.Loc,
-			Msg: "syntax error at end of input",
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
 		}
 	}
 	tokText := p.cur.Str
@@ -221,8 +240,8 @@ func (p *Parser) unknownStatementError() *ParseError {
 		tokText = TokenName(p.cur.Kind)
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: "unknown or unsupported statement starting with " + tokText,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + tokText,
 	}
 }
 
@@ -707,9 +726,12 @@ type ParseResult struct {
 // from a complete parse. The returned *ast.File always reflects whatever
 // statements parsed successfully — even in the error case, the File may
 // be non-empty.
-func Parse(input string) (*ast.File, []ParseError) {
+func Parse(input string) (*ast.File, error) {
 	result := parseAll(input, true)
-	return result.File, result.Errors
+	if len(result.Errors) == 0 {
+		return result.File, nil
+	}
+	return result.File, ParseErrors(result.Errors)
 }
 
 // ParseBestEffort runs Split to segment the input, then parses each segment
@@ -752,13 +774,13 @@ func parseAll(input string, strictTrailing bool) *ParseResult {
 		for _, le := range lx.Errors() {
 			dup := false
 			for _, e := range result.Errors {
-				if e.Loc.Start == le.Loc.Start {
+				if e.Position == le.Loc.Start {
 					dup = true
 					break
 				}
 			}
 			if !dup {
-				result.Errors = append(result.Errors, ParseError{Loc: le.Loc, Msg: le.Msg})
+				result.Errors = append(result.Errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
 			}
 		}
 	}
@@ -792,8 +814,8 @@ func parseSingle(segText string, baseOffset int, strictTrailing bool) (ast.Node,
 				p.errors = append(p.errors, *pe)
 			} else {
 				p.errors = append(p.errors, ParseError{
-					Loc: p.cur.Loc,
-					Msg: err.Error(),
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
 				})
 			}
 		}
@@ -814,6 +836,15 @@ func parseSingle(segText string, baseOffset int, strictTrailing bool) (ast.Node,
 			for p.cur.Kind != tokEOF {
 				p.advance()
 			}
+		} else if strictTrailing && err == nil {
+			// The placeholder scans captured each subquery body and the CTAS
+			// query as raw text without parsing it, so the outer statement
+			// can succeed around a body the engine rejects. Strict mode
+			// parses every body now and drops the statement when one fails.
+			if errs := p.validateRawQueries(); len(errs) > 0 {
+				p.errors = append(p.errors, errs...)
+				node = nil
+			}
 		}
 		result = node
 	}
@@ -821,8 +852,76 @@ func parseSingle(segText string, baseOffset int, strictTrailing bool) (ast.Node,
 	// Promote any lex errors into ParseErrors. The Lexer's Errors() getter
 	// returns positions already shifted by baseOffset.
 	for _, le := range p.lexer.Errors() {
-		p.errors = append(p.errors, ParseError{Loc: le.Loc, Msg: le.Msg})
+		p.errors = append(p.errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+	}
+	// A lex error (an unterminated comment after a complete statement, say)
+	// surfaces only now, after the node was built. Strict mode returns no
+	// node for a segment that carries any error; best-effort keeps the prefix.
+	if strictTrailing && len(p.errors) > 0 {
+		result = nil
 	}
 
-	return result, p.errors
+	return result, dedupeErrors(p.errors)
+}
+
+// dedupeErrors drops a later error that repeats an earlier one's position and
+// message. A raw query body validated by a nested strict parse reports its
+// lexical errors once there and once more when the outer lexer, which
+// scanned the same bytes, promotes its own; the diagnostic must appear once.
+func dedupeErrors(errs []ParseError) []ParseError {
+	if len(errs) < 2 {
+		return errs
+	}
+	type key struct {
+		pos int
+		msg string
+	}
+	seen := make(map[key]bool, len(errs))
+	out := errs[:0]
+	for _, e := range errs {
+		k := key{e.Position, e.Message}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// validateRawQueries strictly parses every query body this parse captured as
+// raw text and returns the errors in the outer statement's coordinates. A body
+// must be exactly one query (SELECT, a set operation, or a grouped query): the
+// engine rejects an empty body, a comment-only body, several statements, and
+// a non-query statement in that position. Nested placeholders are validated
+// by the inner strict parse.
+func (p *Parser) validateRawQueries() []ParseError {
+	var out []ParseError
+	for _, q := range p.rawQueries {
+		if strings.TrimSpace(q.text) == "" {
+			out = append(out, ParseError{Position: q.start, End: q.start, Message: "subquery must contain exactly one query"})
+			continue
+		}
+		res := parseAll(q.text, true)
+		if len(res.Errors) > 0 {
+			for _, e := range res.Errors {
+				e.Position += q.start
+				if e.End >= 0 {
+					e.End += q.start
+				}
+				out = append(out, e)
+			}
+			continue
+		}
+		if len(res.File.Stmts) != 1 {
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+			continue
+		}
+		switch res.File.Stmts[0].(type) {
+		case *ast.SelectStmt, *ast.SetOpStmt, *ast.GroupedQuery:
+		default:
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+		}
+	}
+	return out
 }

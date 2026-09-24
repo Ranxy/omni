@@ -95,8 +95,8 @@ func (p *Parser) parseCreateTable() (ast.Node, error) {
 	// an AS <query>. Without it the statement is invalid (StarRocks rejects it).
 	if len(stmt.CTASColumns) > 0 && stmt.AsSelect == nil {
 		return nil, &ParseError{
-			Loc: p.cur.Loc,
-			Msg: "column-name list requires AS <query> (CTAS)",
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "column-name list requires AS <query> (CTAS)",
 		}
 	}
 
@@ -464,8 +464,8 @@ func (p *Parser) parseDefaultValue() (ast.Node, error) {
 
 	default:
 		return nil, &ParseError{
-			Loc: p.cur.Loc,
-			Msg: fmt.Sprintf("expected DEFAULT value, got %q", p.cur.Str),
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected DEFAULT value, got %q", p.cur.Str),
 		}
 	}
 }
@@ -1038,8 +1038,8 @@ func (p *Parser) parseStepPartition(startLoc ast.Loc) (*ast.PartitionItem, error
 	// Interval amount
 	if p.cur.Kind != tokInt {
 		return nil, &ParseError{
-			Loc: p.cur.Loc,
-			Msg: fmt.Sprintf("expected integer interval amount, got %q", p.cur.Str),
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected integer interval amount, got %q", p.cur.Str),
 		}
 	}
 	item.Interval = p.cur.Str
@@ -1102,8 +1102,8 @@ func (p *Parser) parseBatchRangePartition(startLoc ast.Loc) (*ast.PartitionItem,
 	}
 	if p.cur.Kind != tokInt {
 		return nil, &ParseError{
-			Loc: p.cur.Loc,
-			Msg: fmt.Sprintf("expected integer interval amount, got %q", p.cur.Str),
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected integer interval amount, got %q", p.cur.Str),
 		}
 	}
 	item.Interval = p.cur.Str
@@ -1185,8 +1185,8 @@ func (p *Parser) parsePartitionValueDef() (string, error) {
 		return "", p.syntaxErrorAtCur()
 	default:
 		return "", &ParseError{
-			Loc: p.cur.Loc,
-			Msg: fmt.Sprintf("expected partition value, got %q", p.cur.Str),
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected partition value, got %q", p.cur.Str),
 		}
 	}
 }
@@ -1306,8 +1306,8 @@ func (p *Parser) parseDistributedBy() (*ast.DistributionDesc, error) {
 
 	default:
 		return nil, &ParseError{
-			Loc: p.cur.Loc,
-			Msg: fmt.Sprintf("expected HASH or RANDOM after DISTRIBUTED BY, got %q", p.cur.Str),
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected HASH or RANDOM after DISTRIBUTED BY, got %q", p.cur.Str),
 		}
 	}
 
@@ -1324,8 +1324,8 @@ func (p *Parser) parseDistributedBy() (*ast.DistributionDesc, error) {
 			p.advance()
 		} else {
 			return nil, &ParseError{
-				Loc: p.cur.Loc,
-				Msg: fmt.Sprintf("expected integer or AUTO after BUCKETS, got %q", p.cur.Str),
+				Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+				Message: fmt.Sprintf("expected integer or AUTO after BUCKETS, got %q", p.cur.Str),
 			}
 		}
 	}
@@ -1443,6 +1443,12 @@ func (p *Parser) parseRollupDef() (*ast.RollupDef, error) {
 // parseRawQuery consumes remaining tokens as a raw SQL query (for CTAS).
 // The AS keyword has already been consumed if present.
 func (p *Parser) parseRawQuery() (*ast.RawQuery, error) {
+	if p.cur.Kind == tokEOF || p.cur.Kind == int(';') {
+		// `CREATE TABLE t AS ` with nothing after AS: the EOF token starts
+		// after the trailing whitespace while prev still ends at AS, so the
+		// slice below would run backwards. The engine requires a query here.
+		return nil, &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "syntax error: expected a query after AS"}
+	}
 	startLoc := p.cur.Loc
 	start := p.cur.Loc.Start
 
@@ -1469,6 +1475,7 @@ done:
 	rawText := strings.TrimSpace(sliced)
 	trimmedFromStart := len(sliced) - len(strings.TrimLeft(sliced, " \t\r\n"))
 
+	p.rawQueries = append(p.rawQueries, rawQuery{text: rawText, start: start + trimmedFromStart})
 	return &ast.RawQuery{
 		RawText:   rawText,
 		TextStart: start + trimmedFromStart,

@@ -27,6 +27,7 @@ package parser
 
 import (
 	"github.com/bytebase/omni/trino/ast"
+	"strings"
 )
 
 // Parser is a recursive-descent parser for Trino SQL. It operates on a single
@@ -42,6 +43,25 @@ type Parser struct {
 	nextBuf    Token        // buffered lookahead token
 	hasNext    bool         // whether nextBuf is valid
 	errors     []ParseError // collected errors for best-effort mode
+
+	// strictTrailing mirrors the parseSingle mode: the strict entry point
+	// rejects a segment whose statement parsed but left tokens behind,
+	// dropping the truncated node; best-effort keeps the parsed prefix.
+	strictTrailing bool
+
+	// rawQueries lists every query body this parse captured as raw text
+	// without parsing it (expression subquery placeholders, SHOW STATS FOR
+	// (query)), in source order, so the strict entry point can validate them.
+	// restore truncates it, so an abandoned speculative parse leaves nothing
+	// behind.
+	rawQueries []rawQuery
+}
+
+// rawQuery is a query body captured as raw text: the text and the absolute
+// byte offset of its first character in the parser's input.
+type rawQuery struct {
+	text  string
+	start int
 }
 
 // advance consumes the current token and moves to the next one. Returns the
@@ -109,8 +129,8 @@ func (p *Parser) syntaxErrorAtCur() *ParseError {
 		msg = "syntax error at or near " + text
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: msg,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
 	}
 }
 
@@ -154,8 +174,8 @@ func (p *Parser) skipToNextStatement() {
 // ast.Node values.
 func (p *Parser) unsupported(name string) (ast.Node, error) {
 	err := &ParseError{
-		Loc: p.cur.Loc,
-		Msg: name + " statement parsing is not yet supported",
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: name + " statement parsing is not yet supported",
 	}
 	p.skipToNextStatement()
 	return nil, err
@@ -168,8 +188,8 @@ func (p *Parser) unsupported(name string) (ast.Node, error) {
 func (p *Parser) unknownStatementError() *ParseError {
 	if p.cur.Kind == tokEOF {
 		return &ParseError{
-			Loc: p.cur.Loc,
-			Msg: "syntax error at end of input",
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
 		}
 	}
 	text := p.cur.Str
@@ -177,8 +197,8 @@ func (p *Parser) unknownStatementError() *ParseError {
 		text = TokenName(p.cur.Kind)
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: "unknown or unsupported statement starting with " + text,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + text,
 	}
 }
 
@@ -391,33 +411,70 @@ type ParseResult struct {
 	Errors []ParseError
 }
 
-// Parse is the public entry point. It returns the parsed File plus every error
-// encountered. The File always reflects whatever statements parsed
-// successfully — even in the error case it may be non-empty.
-//
-// The signature returns all errors (matching doris/parser.Parse) rather than a
-// single error: bytebase's Diagnose needs the complete diagnostic set, and a
-// multi-statement script can fail in several places at once.
-func Parse(input string) (*ast.File, []ParseError) {
-	result := ParseBestEffort(input)
-	return result.File, result.Errors
+// Parse is the strict entry point. It returns the parsed File and, when any
+// segment fails, a ParseErrors listing every error; the File holds only the
+// statements that parsed completely, so a caller that reports errors can
+// still show what parsed. A
+// segment whose statement parsed but left tokens behind is a syntax error at
+// the first leftover token and contributes no node: before this, `SELECT a
+// FROM t 1 2` returned the truncated SELECT next to its error, and a
+// consumer that read the File without the errors analyzed less than the
+// engine would execute.
+func Parse(input string) (*ast.File, error) {
+	result := parseAll(input, true)
+	if len(result.Errors) == 0 {
+		return result.File, nil
+	}
+	return result.File, ParseErrors(result.Errors)
 }
 
-// ParseBestEffort runs Split to segment the input, then parses each segment via
-// parseSingle. Per-segment errors are collected; every successfully-parsed
-// statement is appended to the result File. This is the canonical entry point
-// for the bytebase consumers (Diagnose, query-type classification, query-span
-// extraction) that need partial results plus diagnostics.
+// ParseBestEffort is the tolerant entry point for partial or in-progress
+// input. Unlike Parse, it keeps a statement whose prefix parsed even when
+// tokens follow it, and reports no error for them; every other error is still
+// collected. Nothing in the repository consumes this today: Diagnose, query
+// type classification, and query span extraction all read Parse. Do not add
+// the strict trailing-token check here.
 func ParseBestEffort(input string) *ParseResult {
+	return parseAll(input, false)
+}
+
+// parseAll is the shared implementation behind Parse and ParseBestEffort:
+// Split the input, parse each segment, collect nodes and errors.
+// strictTrailing selects whether parseSingle rejects unconsumed trailing
+// tokens.
+func parseAll(input string, strictTrailing bool) *ParseResult {
 	file := &ast.File{Loc: ast.Loc{Start: 0, End: len(input)}}
 	result := &ParseResult{File: file}
 
 	for _, seg := range Split(input) {
-		node, errs := parseSingle(seg.Text, seg.ByteStart)
+		node, errs := parseSingle(seg.Text, seg.ByteStart, strictTrailing)
 		if node != nil {
 			file.Stmts = append(file.Stmts, node)
 		}
 		result.Errors = append(result.Errors, errs...)
+	}
+
+	// Split drops segments that lex to nothing, and with them their lex
+	// errors: Parse("/* unterminated") produced zero segments and zero
+	// errors. Strict mode lexes the whole input once more and promotes any
+	// error the per-segment parses did not already report (matched by
+	// position; segment offsets are absolute).
+	if strictTrailing {
+		lx := NewLexer(input)
+		for lx.NextToken().Kind != tokEOF {
+		}
+		for _, le := range lx.Errors() {
+			dup := false
+			for _, e := range result.Errors {
+				if e.Position == le.Loc.Start {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				result.Errors = append(result.Errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+			}
+		}
 	}
 
 	return result
@@ -431,11 +488,14 @@ func ParseBestEffort(input string) *ParseResult {
 // segText is the statement text without the trailing ';' (from Segment.Text).
 // baseOffset is segText's byte offset within the original input; it is passed
 // to NewLexerWithOffset so token and error Loc values stay absolute.
-func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
+// strictTrailing selects whether a statement that parsed without consuming the
+// whole segment is rejected (node dropped) or kept as the parsed prefix.
+func parseSingle(segText string, baseOffset int, strictTrailing bool) (ast.Node, []ParseError) {
 	p := &Parser{
-		lexer:      NewLexerWithOffset(segText, baseOffset),
-		input:      segText,
-		baseOffset: baseOffset,
+		lexer:          NewLexerWithOffset(segText, baseOffset),
+		input:          segText,
+		baseOffset:     baseOffset,
+		strictTrailing: strictTrailing,
 	}
 	p.advance() // prime cur with the first token
 
@@ -447,16 +507,37 @@ func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
 				p.errors = append(p.errors, *pe)
 			} else {
 				p.errors = append(p.errors, ParseError{
-					Loc: p.cur.Loc,
-					Msg: err.Error(),
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
 				})
 			}
-		} else if p.cur.Kind != tokEOF {
+		} else if strictTrailing && p.cur.Kind != tokEOF {
 			// A statement parsed cleanly but did not consume the whole segment:
 			// the leftover tokens are a syntax error (e.g. `SELECT a a a`,
 			// `SELECT 1 garbage`). Each segment holds exactly one top-level
-			// statement (Split cut on ';'), so any trailing token is invalid here.
+			// statement (Split cut on ';'), so any trailing token is invalid here,
+			// and the segment as a whole does not parse: drop the node like every
+			// other reject path does. EOF is asserted only on the success path; a
+			// parse that already errored left cur mid-statement, and asserting EOF
+			// there would emit a spurious second diagnostic.
 			p.errors = append(p.errors, *p.syntaxErrorAtCur())
+			node = nil
+			// Drain the rest of the segment: the lexer is lazy, so a lexical
+			// error past this point (an unterminated string, say) has not been
+			// reached yet and Errors() below could not promote it.
+			for p.cur.Kind != tokEOF {
+				p.advance()
+			}
+		} else if strictTrailing {
+			// The placeholder scan captured each expression subquery's body
+			// as raw text without parsing it, so the outer statement can
+			// succeed around a body Trino rejects: `SELECT (SELECT 1 FROM t
+			// a b)`. Strict mode parses every body now and drops the
+			// statement when one fails.
+			if errs := p.validateSubqueries(); len(errs) > 0 {
+				p.errors = append(p.errors, errs...)
+				node = nil
+			}
 		}
 		result = node
 	}
@@ -464,8 +545,74 @@ func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
 	// Promote any lex errors into ParseErrors. The Lexer's Errors() getter
 	// returns positions already shifted by baseOffset.
 	for _, le := range p.lexer.Errors() {
-		p.errors = append(p.errors, ParseError{Loc: le.Loc, Msg: le.Msg})
+		p.errors = append(p.errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+	}
+	// A lex error (an unterminated comment after a complete statement, say)
+	// surfaces only now, after the node was built. Strict mode returns no
+	// node for a segment that carries any error; best-effort keeps the prefix.
+	if strictTrailing && len(p.errors) > 0 {
+		result = nil
 	}
 
-	return result, p.errors
+	return result, dedupeErrors(p.errors)
+}
+
+// dedupeErrors drops a later error that repeats an earlier one's position and
+// message. A raw query body validated by a nested strict parse reports its
+// lexical errors once there and once more when the outer lexer, which
+// scanned the same bytes, promotes its own; the diagnostic must appear once.
+func dedupeErrors(errs []ParseError) []ParseError {
+	if len(errs) < 2 {
+		return errs
+	}
+	type key struct {
+		pos int
+		msg string
+	}
+	seen := make(map[key]bool, len(errs))
+	out := errs[:0]
+	for _, e := range errs {
+		k := key{e.Position, e.Message}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// validateSubqueries strictly parses every query body this parse captured as
+// raw text (expression subquery placeholders, SHOW STATS FOR (query)) and
+// returns the errors in the outer statement's coordinates. A body must be
+// exactly one query: Trino rejects an empty body, a comment-only body, several
+// statements, and a non-query statement in that position (checked against the
+// oracle). Nested placeholders are validated by the inner strict parse.
+func (p *Parser) validateSubqueries() []ParseError {
+	var out []ParseError
+	for _, q := range p.rawQueries {
+		if strings.TrimSpace(q.text) == "" {
+			out = append(out, ParseError{Position: q.start, End: q.start, Message: "subquery must contain exactly one query"})
+			continue
+		}
+		res := parseAll(q.text, true)
+		if len(res.Errors) > 0 {
+			for _, e := range res.Errors {
+				e.Position += q.start
+				if e.End >= 0 {
+					e.End += q.start
+				}
+				out = append(out, e)
+			}
+			continue
+		}
+		if len(res.File.Stmts) != 1 {
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+			continue
+		}
+		if qs, ok := res.File.Stmts[0].(*QueryStmt); !ok || qs.Query == nil {
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+		}
+	}
+	return out
 }

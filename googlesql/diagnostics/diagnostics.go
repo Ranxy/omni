@@ -20,6 +20,7 @@ package diagnostics
 
 import (
 	"github.com/bytebase/omni/googlesql/parser"
+	"github.com/bytebase/omni/review"
 )
 
 // Severity classifies the importance of a diagnostic.
@@ -57,14 +58,14 @@ func (s Severity) String() string {
 // coordinate system.
 //
 // Line and Column are 1-based (the first character of a file is line 1, column
-// 1). Column is measured in bytes, not Unicode code points, matching the
-// byte-based tokenization used by the GoogleSQL lexer.
+// 1). Column counts code points, the unit of Bytebase's Position, converted
+// through review.Index like every other position omni reports.
 //
 // Offset is 0-based and refers to the byte position within the full input
 // string passed to Analyze.
 type Position struct {
 	Line   int // 1-based line number
-	Column int // 1-based column (bytes from line start)
+	Column int // 1-based column (code points from line start)
 	Offset int // 0-based byte offset within the source
 }
 
@@ -112,16 +113,19 @@ const source = "googlesql-parser"
 // Line and column numbers are 1-based and measured in bytes. Callers that need
 // Unicode-aware column numbers should post-process the Offset field.
 func Analyze(sql string) []Diagnostic {
-	result := parser.ParseBestEffort(sql)
-	if len(result.Errors) == 0 {
+	// Parse, not ParseBestEffort: the strict entry reports a statement's
+	// trailing junk, which the tolerant one accepts as a parsed prefix.
+	_, err := parser.Parse(sql)
+	errs := parser.AllErrors(err)
+	if len(errs) == 0 {
 		return nil
 	}
 
-	lt := parser.NewLineTable(sql)
-	diags := make([]Diagnostic, 0, len(result.Errors))
+	lt := review.Index(sql)
+	diags := make([]Diagnostic, 0, len(errs))
 
-	for _, pe := range result.Errors {
-		startOff := pe.Loc.Start
+	for _, pe := range errs {
+		startOff := pe.Position
 		if startOff < 0 {
 			startOff = 0
 		}
@@ -129,7 +133,7 @@ func Analyze(sql string) []Diagnostic {
 
 		// End offset may be unknown (-1). Fall back to the start offset so we
 		// produce a zero-width (point) diagnostic rather than a garbage range.
-		endOff := pe.Loc.End
+		endOff := pe.End
 		if endOff < 0 {
 			endOff = startOff
 		}
@@ -142,7 +146,7 @@ func Analyze(sql string) []Diagnostic {
 				End:   Position{Line: endLine, Column: endCol, Offset: endOff},
 			},
 			Source:  source,
-			Message: pe.Msg,
+			Message: pe.Message,
 		})
 	}
 

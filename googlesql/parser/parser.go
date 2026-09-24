@@ -33,6 +33,7 @@ package parser
 
 import (
 	"github.com/bytebase/omni/googlesql/ast"
+	"sort"
 )
 
 // Parser is a recursive-descent parser for GoogleSQL. It operates on a single
@@ -48,6 +49,11 @@ type Parser struct {
 	nextBuf    Token        // buffered lookahead token
 	hasNext    bool         // whether nextBuf is valid
 	errors     []ParseError // collected errors for best-effort mode
+
+	// strictTrailing mirrors the parseSingle mode: the strict entry point
+	// rejects a segment whose statement parsed but left tokens behind,
+	// dropping the truncated node; best-effort keeps the parsed prefix.
+	strictTrailing bool
 
 	// inArrayColumnSchema is set while parsing a table column's type (a
 	// column_schema_inner position) so parseType admits the Spanner ARRAY
@@ -124,8 +130,8 @@ func (p *Parser) syntaxErrorAtCur() *ParseError {
 		msg = "syntax error at or near " + text
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: msg,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
 	}
 }
 
@@ -169,8 +175,8 @@ func (p *Parser) skipToNextStatement() {
 // ast.Node values.
 func (p *Parser) unsupported(name string) (ast.Node, error) {
 	err := &ParseError{
-		Loc: p.cur.Loc,
-		Msg: name + " statement parsing is not yet supported",
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: name + " statement parsing is not yet supported",
 	}
 	p.skipToNextStatement()
 	return nil, err
@@ -183,8 +189,8 @@ func (p *Parser) unsupported(name string) (ast.Node, error) {
 func (p *Parser) unknownStatementError() *ParseError {
 	if p.cur.Type == tokEOF {
 		return &ParseError{
-			Loc: p.cur.Loc,
-			Msg: "syntax error at end of input",
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
 		}
 	}
 	text := p.cur.Str
@@ -192,8 +198,8 @@ func (p *Parser) unknownStatementError() *ParseError {
 		text = TokenName(p.cur.Type)
 	}
 	return &ParseError{
-		Loc: p.cur.Loc,
-		Msg: "unknown or unsupported statement starting with " + text,
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + text,
 	}
 }
 
@@ -246,7 +252,7 @@ func (p *Parser) skipStatementLevelHint() *ParseError {
 			p.advance()
 		}
 		if p.cur.Type != int(']') {
-			return &ParseError{Loc: hintStart, Msg: "unterminated statement hint"}
+			return &ParseError{Position: hintStart.Start, End: hintStart.End, Message: "unterminated statement hint"}
 		}
 		p.advance() // consume ']'
 		if p.cur.Type == int('{') {
@@ -254,7 +260,7 @@ func (p *Parser) skipStatementLevelHint() *ParseError {
 		}
 		// `@[ … @]` with no following `{` body: a hint preamble must carry a
 		// brace body, so this is malformed.
-		return &ParseError{Loc: hintStart, Msg: "unterminated statement hint"}
+		return &ParseError{Position: hintStart.Start, End: hintStart.End, Message: "unterminated statement hint"}
 	case next.Type == tokInteger:
 		p.advance() // consume '@'
 		p.advance() // consume the int
@@ -287,7 +293,7 @@ func (p *Parser) skipBalancedBraces(hintStart ast.Loc) *ParseError {
 	// its malformed `key=value` shape is the later hint node's concern, not an
 	// emptiness error.
 	if p.peekNext().Type == int('}') {
-		return &ParseError{Loc: hintStart, Msg: "empty statement hint"}
+		return &ParseError{Position: hintStart.Start, End: hintStart.End, Message: "empty statement hint"}
 	}
 	depth := 0
 	for p.cur.Type != tokEOF {
@@ -303,7 +309,7 @@ func (p *Parser) skipBalancedBraces(hintStart ast.Loc) *ParseError {
 		}
 		p.advance()
 	}
-	return &ParseError{Loc: hintStart, Msg: "unterminated statement hint"}
+	return &ParseError{Position: hintStart.Start, End: hintStart.End, Message: "unterminated statement hint"}
 }
 
 // parseStmt parses one top-level statement by dispatching on the leading
@@ -569,36 +575,44 @@ func (p *Parser) fillSubqueries(node ast.Node) {
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch sq := n.(type) {
 		case *ast.SubqueryExpr:
-			if sq.Query == nil && sq.RawText != "" {
-				sq.Query = p.reparseSubquery(sq.RawText, sq.Loc)
+			if sq.Query == nil {
+				sq.Query = p.fillSubquery(sq.RawText, sq.TextStart, sq.Loc)
 			}
 		case *ast.ExistsExpr:
-			if sq.Query == nil && sq.RawText != "" {
-				sq.Query = p.reparseSubquery(sq.RawText, sq.Loc)
+			if sq.Query == nil {
+				sq.Query = p.fillSubquery(sq.RawText, sq.TextStart, sq.Loc)
 			}
 		case *ast.ArraySubqueryExpr:
-			if sq.Query == nil && sq.RawText != "" {
-				sq.Query = p.reparseSubquery(sq.RawText, sq.Loc)
+			if sq.Query == nil {
+				sq.Query = p.fillSubquery(sq.RawText, sq.TextStart, sq.Loc)
 			}
 		}
 		return true
 	})
 }
 
+// fillSubquery re-parses one captured body. An empty or comment-only body
+// (`EXISTS()`, `ARRAY(/* c */)`) is not a query; the grammar requires one, so
+// it is recorded as a syntax error at the node instead of silently skipped.
+func (p *Parser) fillSubquery(raw string, textStart int, loc ast.Loc) ast.Node {
+	if raw == "" {
+		p.errors = append(p.errors, ParseError{Position: loc.Start, End: loc.End, Message: "syntax error: expected a query inside the parentheses"})
+		return nil
+	}
+	return p.reparseSubquery(raw, textStart)
+}
+
 // reparseSubquery parses a captured subquery body (the RawText between the outer
-// parens) into a *QueryStmt. It runs a nested Parser over the raw text; lexing
-// uses a best-effort base offset (the node's start) so positions stay close to
-// the original source. A parse failure records the error and returns nil (the
-// node keeps RawText, so round-trip still works). The returned QueryStmt's own
+// parens) into a *QueryStmt. It runs a nested Parser over the raw text with
+// textStart, the absolute offset of RawText's first character, as the lexer
+// base, so every position and error it produces is in the outer text's
+// coordinates. A parse failure records the error and returns nil (the node
+// keeps RawText, so round-trip still works). The returned QueryStmt's own
 // embedded subqueries are filled recursively.
-func (p *Parser) reparseSubquery(raw string, loc ast.Loc) ast.Node {
-	base := 0
-	if loc.Start >= 0 {
-		// Anchor near the original site. The exact column of RawText within the
-		// parens is approximate (leading '(' + whitespace was trimmed), but this
-		// keeps offsets monotonic and close, which is all the query-span / Diagnose
-		// consumers need for an embedded subquery.
-		base = loc.Start
+func (p *Parser) reparseSubquery(raw string, textStart int) ast.Node {
+	base := textStart
+	if base < 0 {
+		base = 0
 	}
 	sub := &Parser{
 		lexer:      NewLexerWithOffset(raw, base),
@@ -614,7 +628,7 @@ func (p *Parser) reparseSubquery(raw string, loc ast.Loc) ast.Node {
 		if pe, ok := err.(*ParseError); ok {
 			p.errors = append(p.errors, *pe)
 		} else {
-			p.errors = append(p.errors, ParseError{Loc: loc, Msg: err.Error()})
+			p.errors = append(p.errors, ParseError{Position: base, End: base + len(raw), Message: err.Error()})
 		}
 		return nil
 	}
@@ -642,23 +656,34 @@ type ParseResult struct {
 	Errors []ParseError
 }
 
-// Parse is the public entry point. It returns the parsed File plus every error
-// encountered. The File always reflects whatever statements parsed
-// successfully — even in the error case it may be non-empty.
-//
-// The signature returns all errors (matching snowflake/trino parser.Parse)
-// rather than a single error: bytebase's Diagnose needs the complete diagnostic
-// set, and a multi-statement script can fail in several places at once.
-func Parse(input string) (*ast.File, []ParseError) {
-	result := ParseBestEffort(input)
-	return result.File, result.Errors
+// Parse is the strict entry point. It returns the parsed File and, when any
+// segment fails, a ParseErrors listing every error; the File holds only the
+// statements that parsed completely, so a caller that reports errors can
+// still show what parsed. A
+// segment whose statement parsed but left tokens behind is a syntax error at
+// the first leftover token and contributes no node.
+func Parse(input string) (*ast.File, error) {
+	result := parseAll(input, true)
+	if len(result.Errors) == 0 {
+		return result.File, nil
+	}
+	return result.File, ParseErrors(result.Errors)
 }
 
-// ParseBestEffort runs Split to segment the input, then parses each segment via
-// parseSingle. Per-segment parse errors are collected; every successfully-parsed
-// statement is appended to the result File. This is the canonical entry point
-// for the bytebase consumers (Diagnose, query-type classification, query-span
-// extraction) that need partial results plus diagnostics.
+// ParseBestEffort is the tolerant entry point for partial or in-progress
+// input. Unlike Parse, it keeps a statement whose prefix parsed even when
+// tokens follow it, and reports no error for them; every other error is still
+// collected. Nothing in the repository consumes this today: diagnostics, query
+// type classification, and query span extraction all read Parse. Do not add
+// the strict trailing-token check here.
+func ParseBestEffort(input string) *ParseResult {
+	return parseAll(input, false)
+}
+
+// parseAll is the shared implementation behind Parse and ParseBestEffort:
+// Split the input, parse each segment, collect nodes and errors.
+// strictTrailing selects whether parseSingle rejects unconsumed trailing
+// tokens.
 //
 // Split (the block-aware variant) is used so a procedural BEGIN/END body is fed
 // to parseSingle whole. The BigQuery lexer-split semantics are available via
@@ -672,25 +697,47 @@ func Parse(input string) (*ast.File, []ParseError) {
 // per-statement parser stopped early on the first error-recovery boundary, or
 // (c) whether Split dropped the containing chunk as "empty" (an unterminated
 // block comment lexes to EOF, so its segment is filtered — yet the lex error
-// must still surface). Parse errors precede lex errors in the result.
-func ParseBestEffort(input string) *ParseResult {
+// must still surface). The result is in source order.
+func parseAll(input string, strictTrailing bool) *ParseResult {
 	file := &ast.File{Loc: ast.Loc{Start: 0, End: len(input)}}
 	result := &ParseResult{File: file}
 
+	lexErrs := collectLexErrors(input)
 	for _, seg := range Split(input) {
-		node, errs := parseSingle(seg.Text, seg.ByteStart)
+		node, errs := parseSingle(seg.Text, seg.ByteStart, strictTrailing)
+		if node != nil && strictTrailing && hasLexErrorIn(lexErrs, seg.ByteStart, seg.ByteEnd) {
+			// The segment lexed with an error (an unterminated comment after
+			// a complete statement, say), which the whole-input pass reports
+			// below. Strict mode returns no node for a segment that carries
+			// any error; best-effort keeps the prefix.
+			node = nil
+		}
 		if node != nil {
 			file.Stmts = append(file.Stmts, node)
 		}
 		result.Errors = append(result.Errors, errs...)
 	}
 
-	// Append lex errors from one authoritative full-input pass (absolute
-	// offsets). Done after parse errors so a statement's syntactic complaint
-	// reads before its lexical one.
-	result.Errors = append(result.Errors, collectLexErrors(input)...)
+	// Merge the lex errors from the one authoritative full-input pass
+	// (absolute offsets) into source order. The sort is stable, so at one
+	// position a statement's syntactic complaint still reads before its
+	// lexical one.
+	result.Errors = append(result.Errors, lexErrs...)
+	sort.SliceStable(result.Errors, func(i, j int) bool {
+		return result.Errors[i].Position < result.Errors[j].Position
+	})
 
 	return result
+}
+
+// hasLexErrorIn reports whether any lex error starts inside [start, end).
+func hasLexErrorIn(errs []ParseError, start, end int) bool {
+	for _, e := range errs {
+		if e.Position >= start && e.Position < end {
+			return true
+		}
+	}
+	return false
 }
 
 // collectLexErrors runs the lexer over the entire input to EOF and returns every
@@ -707,7 +754,7 @@ func collectLexErrors(input string) []ParseError {
 	}
 	out := make([]ParseError, len(lexErrs))
 	for i, le := range lexErrs {
-		out[i] = ParseError{Loc: le.Loc, Msg: le.Msg}
+		out[i] = ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg}
 	}
 	return out
 }
@@ -723,11 +770,14 @@ func collectLexErrors(input string) []ParseError {
 // segText is the statement text without the trailing ';' (from Segment.Text).
 // baseOffset is segText's byte offset within the original input; it is passed
 // to NewLexerWithOffset so token and error Loc values stay absolute.
-func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
+// strictTrailing selects whether a statement that parsed without consuming the
+// whole segment is rejected (node dropped) or kept as the parsed prefix.
+func parseSingle(segText string, baseOffset int, strictTrailing bool) (ast.Node, []ParseError) {
 	p := &Parser{
-		lexer:      NewLexerWithOffset(segText, baseOffset),
-		input:      segText,
-		baseOffset: baseOffset,
+		lexer:          NewLexerWithOffset(segText, baseOffset),
+		input:          segText,
+		baseOffset:     baseOffset,
+		strictTrailing: strictTrailing,
 	}
 	p.advance() // prime cur with the first token
 
@@ -746,11 +796,11 @@ func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
 				p.errors = append(p.errors, *pe)
 			} else {
 				p.errors = append(p.errors, ParseError{
-					Loc: p.cur.Loc,
-					Msg: err.Error(),
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
 				})
 			}
-		} else if p.cur.Type != tokEOF {
+		} else if strictTrailing && p.cur.Type != tokEOF {
 			// The grammar root is `stmts EOF` (antlr_rules.md §1): a complete
 			// statement must be followed by end-of-input. parseStmt succeeded but
 			// left tokens behind — e.g. `GRANT a ON foo TO 'x' garbage` — so the
@@ -763,6 +813,14 @@ func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
 			// path — a parse that already errored left cur mid-statement, so
 			// asserting EOF there would emit a spurious second diagnostic.
 			p.errors = append(p.errors, *p.syntaxErrorAtCur())
+			node = nil
+		} else if strictTrailing && len(p.errors) > 0 {
+			// The segment recorded an error somewhere: a malformed statement
+			// hint before parseStmt (`@[5@] SELECT 1`) or an embedded query
+			// that does not parse (`SELECT (SELECT 1 FROM t a b)`) while
+			// parseStmt still returned a node. It did not parse completely,
+			// so strict mode drops the node; ParseBestEffort keeps the
+			// partial tree.
 			node = nil
 		}
 		result = node

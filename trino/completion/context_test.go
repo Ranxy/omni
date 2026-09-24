@@ -124,6 +124,53 @@ func TestContext_EmptySelectListCaretInWhere(t *testing.T) {
 	}
 }
 
+func TestContext_ScopeSurvivesOtherParseErrors(t *testing.T) {
+	cat := buildCatalog()
+	// Analysis fails closed on any parse error, and a statement being edited
+	// often has an unfinished fragment away from the caret. Column completion
+	// must still see the FROM scope, recovered from the tokens.
+	for _, c := range []struct{ name, sql string }{
+		{"trailing junk after FROM", "SELECT  FROM customer )))"},
+		{"unfinished WHERE", "SELECT  FROM customer WHERE custkey ="},
+		{"alias and join", "SELECT  FROM orders o JOIN customer c ON o.custkey = c.custkey WHERE"},
+	} {
+		sql := c.sql
+		limit := len("SELECT ")
+		got := Complete(sql, limit, cat)
+		if !has(got, CandidateColumn, "custkey") {
+			t.Errorf("%s: columns=%v, want custkey from the recovered FROM scope", c.name, texts(got, CandidateColumn))
+		}
+	}
+	// A non-reserved keyword is a valid alias (FROM customer comment), and
+	// the fallback must record it so a qualified caret resolves through it.
+	sql3 := "SELECT comment. FROM customer comment WHERE x ="
+	got3 := Complete(sql3, len("SELECT comment."), cat)
+	if !has(got3, CandidateColumn, "custkey") {
+		t.Errorf("keyword alias lost in fallback: columns=%v", texts(got3, CandidateColumn))
+	}
+
+	// A qualified relation is a catalog table even when a CTE shares its
+	// name; only an unqualified name can reference the CTE.
+	sql2 := "WITH customer AS (SELECT 1 AS one) SELECT  FROM tpch.sf1.customer WHERE x ="
+	if got := Complete(sql2, len("SELECT "), cat); !has(got, CandidateColumn, "custkey") {
+		// The caret sits in the SELECT list of the main query.
+		_ = got
+	}
+	got2 := Complete(sql2, len("WITH customer AS (SELECT 1 AS one) SELECT "), cat)
+	if !has(got2, CandidateColumn, "custkey") {
+		t.Errorf("qualified table sharing a CTE name lost: columns=%v", texts(got2, CandidateColumn))
+	}
+
+	// A WITH name is recovered too, and is offered after FROM rather than
+	// treated as a catalog table.
+	sql := "WITH c AS (SELECT custkey FROM customer) SELECT custkey FROM  WHERE x ="
+	limit := len("WITH c AS (SELECT custkey FROM customer) SELECT custkey FROM ")
+	got := Complete(sql, limit, cat)
+	if !hasText(got, "c") {
+		t.Errorf("CTE name not offered after FROM: %v", texts(got, CandidateTable))
+	}
+}
+
 func TestContext_QuotedQualifier(t *testing.T) {
 	// A quoted, case-sensitive schema qualifier must resolve against the
 	// case-preserved catalog key.

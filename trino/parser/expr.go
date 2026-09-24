@@ -273,7 +273,11 @@ func (*TypeConstructor) exprNode()       {}
 type SubqueryExpr struct {
 	Kind    SubqueryKind
 	RawText string
-	Loc     ast.Loc
+	// TextStart is the absolute byte offset of RawText's first character in
+	// the parser's input, so errors and locations from re-parsing RawText can
+	// be shifted back into the outer statement's coordinates.
+	TextStart int
+	Loc       ast.Loc
 }
 
 func (n *SubqueryExpr) Span() ast.Loc { return n.Loc }
@@ -312,14 +316,14 @@ func ParseExpression(input string) (Expr, []ParseError) {
 		if pe, ok := err.(*ParseError); ok {
 			return nil, []ParseError{*pe}
 		}
-		return nil, []ParseError{{Msg: err.Error()}}
+		return nil, []ParseError{{Message: err.Error()}}
 	}
 	if p.cur.Kind != tokEOF {
 		text := p.cur.Str
 		if text == "" {
 			text = TokenName(p.cur.Kind)
 		}
-		return expr, []ParseError{{Loc: p.cur.Loc, Msg: "unexpected token after expression: " + text}}
+		return expr, []ParseError{{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "unexpected token after expression: " + text}}
 	}
 	return expr, nil
 }
@@ -765,8 +769,8 @@ func (p *Parser) parseIntervalLiteral() (Expr, error) {
 		}
 		if !ValidIntervalRange(from, to) {
 			return nil, &ParseError{
-				Loc: p.cur.Loc,
-				Msg: "invalid interval qualifier: " + from.String() + " TO " + to.String(),
+				Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+				Message: "invalid interval qualifier: " + from.String() + " TO " + to.String(),
 			}
 		}
 		p.advance() // consume TO
@@ -972,15 +976,19 @@ func (p *Parser) parseSubqueryPlaceholder(startOffset int, kind SubqueryKind) (*
 		}
 	}
 	if depth != 0 {
-		return nil, &ParseError{Loc: p.cur.Loc, Msg: "unterminated subquery"}
+		return nil, &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "unterminated subquery"}
 	}
 	raw := p.sourceSlice(subStart, subEnd)
 	closeTok := p.advance() // consume ')'
-	return &SubqueryExpr{
-		Kind:    kind,
-		RawText: strings.TrimSpace(raw),
-		Loc:     ast.Loc{Start: startOffset, End: closeTok.Loc.End},
-	}, nil
+	trimmed := strings.TrimSpace(raw)
+	sub := &SubqueryExpr{
+		Kind:      kind,
+		RawText:   trimmed,
+		TextStart: subStart + strings.Index(raw, trimmed),
+		Loc:       ast.Loc{Start: startOffset, End: closeTok.Loc.End},
+	}
+	p.rawQueries = append(p.rawQueries, rawQuery{text: sub.RawText, start: sub.TextStart})
+	return sub, nil
 }
 
 // sourceSlice returns the substring of the original input spanning the absolute
@@ -1033,16 +1041,16 @@ func (p *Parser) parseBracketedExprList(closer TokenKind) ([]Expr, Token, error)
 // reports "expected expression".
 func (p *Parser) exprError() *ParseError {
 	if p.cur.Kind == tokEOF {
-		return &ParseError{Loc: p.cur.Loc, Msg: "expected expression, found end of input"}
+		return &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "expected expression, found end of input"}
 	}
 	text := p.cur.Str
 	if text == "" {
 		text = TokenName(p.cur.Kind)
 	}
-	return &ParseError{Loc: p.cur.Loc, Msg: "expected expression, found " + text}
+	return &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "expected expression, found " + text}
 }
 
 // exprErrorAt returns a *ParseError with a custom message at the current token.
 func (p *Parser) exprErrorAt(msg string) *ParseError {
-	return &ParseError{Loc: p.cur.Loc, Msg: msg}
+	return &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: msg}
 }

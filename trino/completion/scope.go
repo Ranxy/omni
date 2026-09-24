@@ -54,24 +54,129 @@ func analyzeAtCaret(sql string, limit int) *analysis.QuerySpan {
 	patched := stmt[:rel] + " " + placeholder + " " + stmt[rel:]
 
 	span, err := analysis.GetQuerySpan(patched)
-	if err != nil {
-		return nil
+	if err == nil && span != nil && (len(span.AccessTables) > 0 || len(span.CTEs) > 0) {
+		return span
 	}
 	// Robustness fallback: a statement can carry a SECOND incomplete clause away
 	// from the caret — most commonly an empty SELECT list ("SELECT  FROM t"
-	// while the caret edits the WHERE) — which fails the parse so no FROM scope
-	// is recovered. If the caret-patched parse found neither tables nor CTEs,
-	// retry once with empty SELECT lists filled by a placeholder select item, so
-	// the FROM clause becomes reachable.
-	if span != nil && len(span.AccessTables) == 0 && len(span.CTEs) == 0 {
-		if filled := fillEmptySelectLists(patched); filled != patched {
-			if span2, err2 := analysis.GetQuerySpan(filled); err2 == nil && span2 != nil &&
-				(len(span2.AccessTables) > 0 || len(span2.CTEs) > 0) {
-				return span2
+	// while the caret edits the WHERE). Analysis fails closed on any parse
+	// error, so that statement yields no span at all; retry once with empty
+	// SELECT lists filled by a placeholder select item, so the FROM clause
+	// becomes reachable. A statement that still does not parse has no scope.
+	if filled := fillEmptySelectLists(patched); filled != patched {
+		if span2, err2 := analysis.GetQuerySpan(filled); err2 == nil && span2 != nil &&
+			(len(span2.AccessTables) > 0 || len(span2.CTEs) > 0) {
+			return span2
+		}
+	}
+	if err != nil {
+		// The statement still does not parse: another unfinished fragment
+		// sits away from the caret (SELECT | FROM customer WHERE x =). The
+		// user is mid-edit, so recover the FROM/JOIN relations and WITH names
+		// from the tokens instead of offering nothing.
+		return lexerScope(patched)
+	}
+	return span
+}
+
+// lexerScope recovers the relations a statement reads from its tokens alone:
+// every dotted name after FROM or JOIN (and the comma-separated names that
+// continue a FROM list), with an optional alias, plus the names a WITH clause
+// declares. It over-approximates on purpose: this is completion scope, where
+// an extra table costs a spurious candidate and a missing one hides every
+// column. Returns nil when nothing is found.
+func lexerScope(stmt string) *analysis.QuerySpan {
+	toks, _ := parser.Tokenize(stmt)
+	span := &analysis.QuerySpan{}
+	seen := map[scopeTable]bool{}
+	cte := map[string]bool{}
+
+	addRelation := func(k int) int {
+		st, n := readDottedRelation(toks, k, true)
+		if st == nil {
+			return 0
+		}
+		// Only an unqualified name can reference a CTE; prod.customer is a
+		// catalog table even when a CTE is also called customer.
+		isCTE := st.catalog == "" && st.schema == "" && cte[st.table]
+		if st.table != placeholder && !isCTE && !seen[*st] {
+			seen[*st] = true
+			span.AccessTables = append(span.AccessTables, analysis.TableAccess{
+				Catalog: st.catalog, Schema: st.schema, Table: st.table, Alias: st.alias,
+			})
+		}
+		return n
+	}
+
+	for i := 0; i < len(toks); i++ {
+		tok := toks[i]
+		switch {
+		case isKeyword(tok, "with"):
+			// WITH [RECURSIVE] name [(cols)] AS (...) [, name ...]
+			k := i + 1
+			if isKeywordAt(toks, k, "recursive") {
+				k++
+			}
+			for k < len(toks) && isNameToken(toks[k]) {
+				name := normalizeQualifierPart(toks[k])
+				k++
+				if k < len(toks) && toks[k].Kind == int('(') {
+					k = skipParens(toks, k)
+				}
+				if !isKeywordAt(toks, k, "as") {
+					break
+				}
+				if name != placeholder && !cte[name] {
+					cte[name] = true
+					span.CTEs = append(span.CTEs, name)
+				}
+				k++
+				if k < len(toks) && toks[k].Kind == int('(') {
+					k = skipParens(toks, k)
+				}
+				if k < len(toks) && toks[k].Kind == int(',') {
+					k++
+					continue
+				}
+				break
+			}
+		case isKeyword(tok, "from") || isKeyword(tok, "join"):
+			k := i + 1
+			for {
+				n := addRelation(k)
+				if n == 0 {
+					break
+				}
+				k += n
+				if !isKeyword(tok, "from") || k >= len(toks) || toks[k].Kind != int(',') {
+					break
+				}
+				k++
 			}
 		}
 	}
+	if len(span.AccessTables) == 0 && len(span.CTEs) == 0 {
+		return nil
+	}
 	return span
+}
+
+// skipParens returns the index just past the parenthesised group that opens
+// at toks[k], or len(toks) when it never closes.
+func skipParens(toks []parser.Token, k int) int {
+	depth := 0
+	for ; k < len(toks); k++ {
+		switch toks[k].Kind {
+		case int('('):
+			depth++
+		case int(')'):
+			depth--
+			if depth == 0 {
+				return k + 1
+			}
+		}
+	}
+	return k
 }
 
 // fillEmptySelectLists inserts a placeholder select item into any "SELECT FROM"
@@ -223,18 +328,48 @@ func readDottedRelation(toks []parser.Token, j int, allowAlias bool) (*scopeTabl
 	default:
 		st.catalog, st.schema, st.table = parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1]
 	}
-	// Optional alias (MERGE only): "AS x" or a bare following identifier (a
-	// keyword such as SET that starts the next clause is not an alias).
+	// Optional alias: "AS x" or a bare following identifier. Trino also
+	// accepts a non-reserved keyword as an alias (FROM customer comment), but
+	// a clause keyword such as LIMIT or FETCH takes an operand, so a keyword
+	// is an alias only when nothing operand-like follows it. A reserved word
+	// (WHERE, JOIN, USING) never is.
 	if allowAlias && k < len(toks) {
-		if isKeyword(toks[k], "as") && k+1 < len(toks) && isPlainIdent(toks[k+1]) {
+		if isKeyword(toks[k], "as") && k+1 < len(toks) && isAliasToken(toks[k+1]) {
 			st.alias = normalizeQualifierPart(toks[k+1])
 			k += 2
 		} else if isPlainIdent(toks[k]) {
 			st.alias = normalizeQualifierPart(toks[k])
 			k++
+		} else if isAliasToken(toks[k]) && !operandFollows(toks, k+1) {
+			st.alias = normalizeQualifierPart(toks[k])
+			k++
 		}
 	}
 	return st, k - j
+}
+
+// isAliasToken reports whether tok can be a relation alias: an identifier or
+// a non-reserved keyword.
+func isAliasToken(tok parser.Token) bool {
+	if isPlainIdent(tok) {
+		return true
+	}
+	return isNameToken(tok) && !isQuotedNameToken(tok) && !isReservedWord(tok.Str)
+}
+
+// operandFollows reports whether toks[k] looks like the operand of a clause
+// keyword (a literal, a name, or a non-reserved keyword) rather than the
+// start of the next clause, a separator, or the end of input.
+func operandFollows(toks []parser.Token, k int) bool {
+	if k >= len(toks) {
+		return false
+	}
+	tok := toks[k]
+	switch parser.TokenName(tok.Kind) {
+	case "STRING", "UNICODE_STRING", "BINARY_LITERAL", "INTEGER_VALUE", "DECIMAL_VALUE", "DOUBLE_VALUE":
+		return true
+	}
+	return isAliasToken(tok)
 }
 
 // isKeywordAt reports whether toks[i] is the given keyword (bounds-checked).
