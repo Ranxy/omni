@@ -149,6 +149,13 @@ func (l *Lexer) nextTokenInner() Token {
 			if l.state == stateXQS {
 				return l.lexQuoteContinue()
 			}
+			// An unterminated construct reports its error at the construct's
+			// start (PostgreSQL's yylloc), not at end of input. lexComment
+			// reaches this branch after setting Err, with l.start still at
+			// the "/*" that opened the comment.
+			if l.Err != nil {
+				return Token{Type: lex_EOF, Loc: l.start}
+			}
 			return Token{Type: lex_EOF, Loc: l.pos}
 		}
 
@@ -818,6 +825,7 @@ func (l *Lexer) lexParam() Token {
 	// Check for trailing junk
 	if l.pos < len(l.input) && isIdentStart(l.input[l.pos]) {
 		l.Err = fmt.Errorf("trailing junk after parameter")
+		l.consumeJunkIdent()
 		return Token{Type: lex_EOF, Loc: l.start}
 	}
 
@@ -932,11 +940,19 @@ func (l *Lexer) lexNumber() Token {
 	// Check for exponent
 	if l.pos < len(l.input) && (l.input[l.pos] == 'e' || l.input[l.pos] == 'E') {
 		l.pos++
+		hasSign := false
 		if l.pos < len(l.input) && (l.input[l.pos] == '+' || l.input[l.pos] == '-') {
 			l.pos++
+			hasSign = true
 		}
 		if l.pos >= len(l.input) || !isDigit(l.input[l.pos]) {
 			l.Err = fmt.Errorf("trailing junk after numeric literal")
+			// Flex takes the longest match: "1efoo" is {integer_junk}
+			// (literal + identifier "efoo"), while "1e+foo" is {real_fail}
+			// ("1e+"), which beats the shorter {integer_junk} "1e".
+			if !hasSign {
+				l.consumeJunkIdent()
+			}
 			return Token{Type: lex_EOF, Loc: l.start}
 		}
 		l.scanDecDigits()
@@ -947,6 +963,7 @@ done:
 	// Check for trailing identifier
 	if l.pos < len(l.input) && isIdentStart(l.input[l.pos]) {
 		l.Err = fmt.Errorf("trailing junk after numeric literal")
+		l.consumeJunkIdent()
 		return Token{Type: lex_EOF, Loc: l.start}
 	}
 
@@ -982,92 +999,73 @@ func (l *Lexer) scanDecDigits() {
 
 // lexHexNumber handles 0x... hex integers.
 func (l *Lexer) lexHexNumber() Token {
-	start := l.pos
-	l.pos += 2 // skip 0x
-
-	if l.pos >= len(l.input) || (!isHexDigit(l.input[l.pos]) && l.input[l.pos] != '_') {
-		l.Err = fmt.Errorf("invalid hexadecimal integer")
-		return Token{Type: lex_EOF, Loc: l.start}
-	}
-
-	for l.pos < len(l.input) && (isHexDigit(l.input[l.pos]) || l.input[l.pos] == '_') {
-		l.pos++
-	}
-
-	if l.pos < len(l.input) && isIdentStart(l.input[l.pos]) {
-		l.Err = fmt.Errorf("trailing junk after numeric literal")
-		return Token{Type: lex_EOF, Loc: l.start}
-	}
-
-	numStr := l.input[start:l.pos]
-	numStr = strings.ReplaceAll(numStr, "_", "")
-
-	val, err := strconv.ParseInt(numStr[2:], 16, 64)
-	if err != nil {
-		return Token{Type: lex_FCONST, Str: numStr, Loc: l.start}
-	}
-
-	return Token{Type: lex_ICONST, Ival: val, Str: numStr, Loc: l.start}
+	return l.lexRadixNumber(16, isHexDigit, "invalid hexadecimal integer")
 }
 
 // lexOctalNumber handles 0o... octal integers.
 func (l *Lexer) lexOctalNumber() Token {
-	start := l.pos
-	l.pos += 2 // skip 0o
-
-	if l.pos >= len(l.input) || (!isOctalDigit(l.input[l.pos]) && l.input[l.pos] != '_') {
-		l.Err = fmt.Errorf("invalid octal integer")
-		return Token{Type: lex_EOF, Loc: l.start}
-	}
-
-	for l.pos < len(l.input) && (isOctalDigit(l.input[l.pos]) || l.input[l.pos] == '_') {
-		l.pos++
-	}
-
-	if l.pos < len(l.input) && isIdentStart(l.input[l.pos]) {
-		l.Err = fmt.Errorf("trailing junk after numeric literal")
-		return Token{Type: lex_EOF, Loc: l.start}
-	}
-
-	numStr := l.input[start:l.pos]
-	numStr = strings.ReplaceAll(numStr, "_", "")
-
-	val, err := strconv.ParseInt(numStr[2:], 8, 64)
-	if err != nil {
-		return Token{Type: lex_FCONST, Str: numStr, Loc: l.start}
-	}
-
-	return Token{Type: lex_ICONST, Ival: val, Str: numStr, Loc: l.start}
+	return l.lexRadixNumber(8, isOctalDigit, "invalid octal integer")
 }
 
 // lexBinaryNumber handles 0b... binary integers.
 func (l *Lexer) lexBinaryNumber() Token {
+	return l.lexRadixNumber(2, isBinaryDigit, "invalid binary integer")
+}
+
+// lexRadixNumber scans a 0x/0o/0b integer the way PostgreSQL's flex rules
+// do, where the longest match wins. Over the identifier run R that follows
+// the prefix:
+//   - R empty or "_": {hexfail} 0[xX]_? ties {integer_junk} and, being
+//     listed first, wins: "invalid hexadecimal integer" over "0x" / "0x_".
+//   - R entirely (_?{hexdigit})+: {hexinteger} spans the whole run and wins.
+//   - otherwise {integer_junk} ("0" followed by an identifier) is the
+//     longest match: "trailing junk after numeric literal" over "0x" + R,
+//     which covers "0xg", "0x_g", "0x1_" and "0x1__2" alike.
+func (l *Lexer) lexRadixNumber(base int, isRadixDigit func(byte) bool, invalidMsg string) Token {
 	start := l.pos
-	l.pos += 2 // skip 0b
-
-	if l.pos >= len(l.input) || (!isBinaryDigit(l.input[l.pos]) && l.input[l.pos] != '_') {
-		l.Err = fmt.Errorf("invalid binary integer")
-		return Token{Type: lex_EOF, Loc: l.start}
-	}
-
-	for l.pos < len(l.input) && (isBinaryDigit(l.input[l.pos]) || l.input[l.pos] == '_') {
+	l.pos += 2 // skip the 0x/0o/0b prefix
+	runStart := l.pos
+	for l.pos < len(l.input) && isIdentCont(l.input[l.pos]) {
 		l.pos++
 	}
-
-	if l.pos < len(l.input) && isIdentStart(l.input[l.pos]) {
+	run := l.input[runStart:l.pos]
+	if run == "" || run == "_" {
+		l.Err = fmt.Errorf("%s", invalidMsg)
+		return Token{Type: lex_EOF, Loc: l.start}
+	}
+	if !isRadixDigitRun(run, isRadixDigit) {
 		l.Err = fmt.Errorf("trailing junk after numeric literal")
 		return Token{Type: lex_EOF, Loc: l.start}
 	}
 
-	numStr := l.input[start:l.pos]
-	numStr = strings.ReplaceAll(numStr, "_", "")
-
-	val, err := strconv.ParseInt(numStr[2:], 2, 64)
+	numStr := strings.ReplaceAll(l.input[start:l.pos], "_", "")
+	val, err := strconv.ParseInt(numStr[2:], base, 64)
 	if err != nil {
 		return Token{Type: lex_FCONST, Str: numStr, Loc: l.start}
 	}
-
 	return Token{Type: lex_ICONST, Ival: val, Str: numStr, Loc: l.start}
+}
+
+// isRadixDigitRun reports whether run matches (_?digit)+: at least one
+// digit, single underscores allowed before any digit, none trailing.
+func isRadixDigitRun(run string, isRadixDigit func(byte) bool) bool {
+	sawDigit := false
+	prevUnderscore := false
+	for i := 0; i < len(run); i++ {
+		switch {
+		case run[i] == '_':
+			if prevUnderscore {
+				return false
+			}
+			prevUnderscore = true
+		case isRadixDigit(run[i]):
+			sawDigit = true
+			prevUnderscore = false
+		default:
+			return false
+		}
+	}
+	return sawDigit && !prevUnderscore
 }
 
 // lexIdent handles identifiers and keywords.
@@ -1129,6 +1127,16 @@ func hexValue(ch byte) int {
 		return int(ch - 'a' + 10)
 	}
 	return int(ch - 'A' + 10)
+}
+
+// consumeJunkIdent extends the current token over the identifier that made
+// a numeric literal or parameter invalid. PostgreSQL's junk rules
+// ({integer_junk}, {param_junk}, ...) match the literal followed by a whole
+// {identifier}, so the diagnostic quotes "123abc" rather than the valid "123".
+func (l *Lexer) consumeJunkIdent() {
+	for l.pos < len(l.input) && isIdentCont(l.input[l.pos]) {
+		l.pos++
+	}
 }
 
 func isIdentStart(ch byte) bool {
